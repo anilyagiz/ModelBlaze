@@ -3,10 +3,16 @@ Report Generator - Generate beautiful optimization reports
 Formats: HTML, JSON, Text, Markdown
 """
 
+import html
 import json
 from typing import Dict, Any, Optional
 from pathlib import Path
 from datetime import datetime
+import logging
+
+from src.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class ReportGenerator:
@@ -16,6 +22,19 @@ class ReportGenerator:
 
     def __init__(self):
         self.supported_formats = ["html", "json", "text", "markdown"]
+
+    @staticmethod
+    def _escape_html(value: Any) -> str:
+        """
+        HTML-escape any value to prevent XSS attacks
+
+        Args:
+            value: Value to escape
+
+        Returns:
+            HTML-safe string
+        """
+        return html.escape(str(value))
 
     def generate(
         self,
@@ -412,10 +431,11 @@ class ReportGenerator:
                 <div class="metric-grid">
 """
                 if "size_reduction_pct" in imp:
+                    # Security: HTML-escape all user-controlled data to prevent XSS
                     html += f"""
                     <div class="metric-card">
                         <h3>Size Reduction</h3>
-                        <div class="value">{imp['size_reduction_str']}</div>
+                        <div class="value">{self._escape_html(imp['size_reduction_str'])}</div>
                         <div class="improvement">
                             {comp['original']['size_mb']:.2f} MB → {comp['optimized']['size_mb']:.2f} MB
                         </div>
@@ -426,7 +446,7 @@ class ReportGenerator:
                     html += f"""
                     <div class="metric-card">
                         <h3>Speed Improvement</h3>
-                        <div class="value">{imp['latency_speedup_str']}</div>
+                        <div class="value">{self._escape_html(imp['latency_speedup_str'])}</div>
                         <div class="improvement">
                             {comp['original']['mean_latency_ms']:.2f} ms → {comp['optimized']['mean_latency_ms']:.2f} ms
                         </div>
@@ -462,15 +482,15 @@ class ReportGenerator:
                     </tr>
                     <tr>
                         <td>Target Device</td>
-                        <td><span class="badge badge-info">{config.get('target_device', 'N/A')}</span></td>
+                        <td><span class="badge badge-info">{self._escape_html(config.get('target_device', 'N/A'))}</span></td>
                     </tr>
                     <tr>
                         <td>Optimization Level</td>
-                        <td><span class="badge badge-success">{config.get('optimization_level', 'N/A')}</span></td>
+                        <td><span class="badge badge-success">{self._escape_html(config.get('optimization_level', 'N/A'))}</span></td>
                     </tr>
                     <tr>
                         <td>Quantization</td>
-                        <td>{config.get('quantization_mode', 'N/A')}</td>
+                        <td>{self._escape_html(config.get('quantization_mode', 'N/A'))}</td>
                     </tr>
                     <tr>
                         <td>Pruning Sparsity</td>
@@ -495,17 +515,17 @@ class ReportGenerator:
                     </tr>
                     <tr>
                         <td>Framework</td>
-                        <td>{orig.get('framework', 'N/A')}</td>
-                        <td>{opt.get('framework', 'N/A')}</td>
+                        <td>{self._escape_html(orig.get('framework', 'N/A'))}</td>
+                        <td>{self._escape_html(opt.get('framework', 'N/A'))}</td>
                     </tr>
                     <tr>
                         <td>Format</td>
-                        <td>{orig.get('format', 'N/A')}</td>
-                        <td>{opt.get('format', 'N/A')}</td>
+                        <td>{self._escape_html(orig.get('format', 'N/A'))}</td>
+                        <td>{self._escape_html(opt.get('format', 'N/A'))}</td>
                     </tr>
                     <tr>
                         <td>Size</td>
-                        <td>{orig.get('size_str', 'N/A')}</td>
+                        <td>{self._escape_html(orig.get('size_str', 'N/A'))}</td>
                         <td>{opt.get('size_mb', 0):.2f} MB</td>
                     </tr>
                 </table>
