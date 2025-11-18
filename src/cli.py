@@ -10,6 +10,11 @@ import numpy as np
 from src.optimizer import ModelBlaze
 from src.report_generator import ReportGenerator
 from src.model_loader import ModelLoader
+from src.utils.path_validator import PathValidator
+from src.utils.error_handler import ErrorHandler, ValidationError
+from src.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 @click.group()
@@ -25,10 +30,10 @@ def cli():
 
 
 @cli.command()
-@click.argument("model_path", type=click.Path(exists=True))
+@click.argument("model_path", type=str)  # Will validate manually for security
 @click.option(
     "--output", "-o",
-    type=click.Path(),
+    type=str,
     help="Output path for optimized model"
 )
 @click.option(
@@ -79,6 +84,31 @@ def optimize(model_path, output, target, level, quantization, pruning, report, r
         modelblaze optimize model.onnx --target iphone --level high
     """
     try:
+        logger.info(f"Starting optimization for {model_path}")
+
+        # Validate input path (Security: prevent path traversal, symlink attacks)
+        try:
+            validated_input_path = PathValidator.validate_input_path(model_path)
+            logger.debug(f"Validated input path: {validated_input_path}")
+        except (ValueError, FileNotFoundError, PermissionError) as e:
+            click.echo(f"❌ {str(e)}", err=True)
+            sys.exit(1)
+
+        # Validate output path (Security: prevent path traversal)
+        validated_output_path = None
+        if output:
+            try:
+                workspace = PathValidator.get_safe_workspace()
+                validated_output_path = PathValidator.validate_output_path(
+                    output,
+                    allowed_base_dir=workspace,
+                    create_dirs=True
+                )
+                logger.debug(f"Validated output path: {validated_output_path}")
+            except (ValueError, PermissionError) as e:
+                click.echo(f"❌ Çıkış yolu hatası: {str(e)}", err=True)
+                sys.exit(1)
+
         # Initialize optimizer
         optimizer = ModelBlaze()
 
@@ -86,12 +116,12 @@ def optimize(model_path, output, target, level, quantization, pruning, report, r
         test_input = None
         if not no_benchmark:
             click.echo("📊 Generating test input for benchmarking...")
-            test_input = optimizer._generate_dummy_input(model_path)
+            test_input = optimizer._generate_dummy_input(str(validated_input_path))
 
-        # Run optimization
+        # Run optimization with validated paths
         results = optimizer.optimize(
-            model_path=model_path,
-            output_path=output,
+            model_path=str(validated_input_path),
+            output_path=str(validated_output_path) if validated_output_path else None,
             target_device=target,
             optimization_level=level,
             quantization_mode=quantization if quantization != "none" else "int8",
@@ -105,18 +135,61 @@ def optimize(model_path, output, target, level, quantization, pruning, report, r
             click.echo(f"\n📄 Generating {report} report...")
             generator = ReportGenerator()
 
-            # Determine report path
+            # Determine report path with validation
             if report_path is None and report != "text":
-                model_name = Path(model_path).stem
+                model_name = PathValidator.sanitize_filename(validated_input_path.stem)
                 report_ext = "html" if report == "html" else "md" if report == "markdown" else "json"
-                report_path = f"modelblaze_report_{model_name}.{report_ext}"
+                workspace = PathValidator.get_safe_workspace()
+                report_path = str(workspace / f"modelblaze_report_{model_name}.{report_ext}")
+            elif report_path:
+                # Validate report path
+                try:
+                    workspace = PathValidator.get_safe_workspace()
+                    validated_report_path = PathValidator.validate_output_path(
+                        report_path,
+                        allowed_base_dir=workspace,
+                        create_dirs=True
+                    )
+                    report_path = str(validated_report_path)
+                except (ValueError, PermissionError) as e:
+                    click.echo(f"❌ Rapor yolu hatası: {str(e)}", err=True)
+                    sys.exit(1)
 
             generator.generate(results, report_path, format=report)
 
         click.echo("\n✅ Optimization complete!")
+        logger.info("Optimization completed successfully")
 
+    except FileNotFoundError as e:
+        error_msg = ErrorHandler.handle_error(e, logger=logger)
+        click.echo(f"❌ {error_msg}", err=True)
+        sys.exit(1)
+    except PermissionError as e:
+        error_msg = ErrorHandler.handle_error(e, logger=logger)
+        click.echo(f"❌ {error_msg}", err=True)
+        sys.exit(1)
+    except ImportError as e:
+        error_msg = ErrorHandler.wrap_import_error(e)
+        logger.error(f"Import error: {e}", exc_info=True)
+        click.echo(f"❌ {error_msg}", err=True)
+        sys.exit(1)
+    except ValueError as e:
+        # ValueError typically contains user-friendly messages
+        logger.warning(f"Validation error: {e}")
+        click.echo(f"❌ {str(e)}", err=True)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        click.echo("\n❌ İşlem kullanıcı tarafından iptal edildi.", err=True)
+        logger.info("Operation cancelled by user")
+        sys.exit(130)
     except Exception as e:
-        click.echo(f"❌ Error: {str(e)}", err=True)
+        # Unexpected errors - log details but show generic message
+        error_msg = ErrorHandler.handle_error(
+            e,
+            user_message="Beklenmeyen bir hata oluştu. Lütfen log dosyalarını kontrol edin.",
+            logger=logger
+        )
+        click.echo(f"❌ {error_msg}", err=True)
         sys.exit(1)
 
 

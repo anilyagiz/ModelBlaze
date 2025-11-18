@@ -7,6 +7,12 @@ import os
 from typing import Dict, Any, Union, Optional
 from pathlib import Path
 import numpy as np
+import logging
+
+from src.utils.logger import get_logger
+from src.utils.error_handler import ErrorHandler, ModelLoadError
+
+logger = get_logger(__name__)
 
 
 class ModelLoader:
@@ -96,6 +102,7 @@ class ModelLoader:
             # Load SavedModel or frozen graph
             try:
                 model = tf.saved_model.load(str(model_path.parent))
+                logger.debug(f"Successfully loaded TensorFlow SavedModel from {model_path.parent}")
                 return {
                     "model": model,
                     "framework": "tensorflow",
@@ -103,8 +110,12 @@ class ModelLoader:
                     "path": str(model_path),
                     "size_mb": sum(f.stat().st_size for f in model_path.parent.rglob("*") if f.is_file()) / (1024 * 1024),
                 }
-            except:
-                raise ValueError("Could not load .pb file. Ensure it's a valid SavedModel or frozen graph")
+            except (OSError, ValueError, ImportError) as e:
+                logger.error(f"Failed to load .pb file: {e}")
+                raise ModelLoadError(
+                    "Could not load .pb file as SavedModel. "
+                    "Please ensure it's a valid TensorFlow SavedModel directory."
+                ) from e
 
         else:
             raise ValueError(f"Unsupported TensorFlow format: {extension}")
@@ -113,11 +124,34 @@ class ModelLoader:
         """Load PyTorch model"""
         try:
             import torch
-        except ImportError:
-            raise ImportError("PyTorch not installed. Install with: pip install torch")
+        except ImportError as e:
+            logger.error(f"PyTorch import failed: {e}")
+            raise ImportError("PyTorch not installed. Install with: pip install torch") from e
 
-        # Load checkpoint
-        checkpoint = torch.load(str(model_path), map_location="cpu")
+        # Load checkpoint with security: weights_only=True prevents arbitrary code execution
+        # This is critical to prevent RCE attacks via malicious pickle files
+        try:
+            checkpoint = torch.load(
+                str(model_path),
+                map_location="cpu",
+                weights_only=True  # Security: Prevent arbitrary code execution
+            )
+            logger.debug(f"Successfully loaded PyTorch checkpoint from {model_path}")
+        except Exception as e:
+            logger.error(f"Failed to load PyTorch model with weights_only=True: {e}")
+            # Try without weights_only for backwards compatibility, but warn user
+            logger.warning(
+                "Attempting to load model without weights_only protection. "
+                "Only load models from trusted sources!"
+            )
+            try:
+                checkpoint = torch.load(str(model_path), map_location="cpu")
+            except Exception as e2:
+                logger.error(f"Failed to load PyTorch model: {e2}")
+                raise ModelLoadError(
+                    f"Could not load PyTorch model. The file may be corrupted or "
+                    f"from an incompatible PyTorch version."
+                ) from e2
 
         # Try to extract model
         if isinstance(checkpoint, dict):

@@ -4,10 +4,17 @@ Supports: INT8, FP16, dynamic quantization
 """
 
 import os
-import tempfile
+import shutil
 from typing import Dict, Any, Optional, Callable
 from pathlib import Path
 import numpy as np
+import logging
+
+from src.utils.logger import get_logger
+from src.utils.error_handler import ErrorHandler, OptimizationError
+from src.utils.temporary_utils import temporary_directory
+
+logger = get_logger(__name__)
 
 
 class Quantizer:
@@ -61,77 +68,102 @@ class Quantizer:
         """Quantize TensorFlow model"""
         try:
             import tensorflow as tf
-        except ImportError:
-            raise ImportError("TensorFlow not installed")
+        except ImportError as e:
+            logger.error(f"TensorFlow not installed: {e}")
+            raise ImportError("TensorFlow not installed. Install with: pip install tensorflow>=2.13.0") from e
 
         model = model_data["model"]
 
-        # Create output path
-        if output_path is None:
-            output_dir = tempfile.mkdtemp()
-            output_path = os.path.join(output_dir, f"quantized_{mode}.tflite")
+        # Use temporary directory with automatic cleanup
+        use_temp_dir = output_path is None
+        temp_output = None
 
-        # Convert to TFLite with quantization
-        if model_data["format"] == "keras":
-            converter = tf.lite.TFLiteConverter.from_keras_model(model)
-        elif model_data["format"] == "saved_model":
-            converter = tf.lite.TFLiteConverter.from_saved_model(model_data["path"])
-        elif model_data["format"] == "tflite":
-            # Already TFLite, re-quantize
-            converter = tf.lite.TFLiteConverter.from_saved_model(model_data["path"])
-        else:
-            raise ValueError(f"Cannot convert {model_data['format']} to TFLite")
+        # Use context manager for temp directory (automatic cleanup)
+        with temporary_directory() as tmpdir:
+            # Determine output path
+            if use_temp_dir:
+                temp_output = tmpdir / f"quantized_{mode}.tflite"
+                output_path = str(temp_output)
 
-        # Set quantization options
-        if mode == "int8":
-            converter.optimizations = [tf.lite.Optimize.DEFAULT]
+            logger.info(f"Quantizing TensorFlow model to {mode} mode")
 
-            if calibration_data is not None:
-                # Full integer quantization with calibration
-                def representative_dataset():
-                    for data in calibration_data:
-                        yield [np.array([data], dtype=np.float32)]
+            # Convert to TFLite with quantization
+            try:
+                if model_data["format"] == "keras":
+                    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+                elif model_data["format"] == "saved_model":
+                    converter = tf.lite.TFLiteConverter.from_saved_model(model_data["path"])
+                elif model_data["format"] == "tflite":
+                    # Already TFLite, re-quantize
+                    converter = tf.lite.TFLiteConverter.from_saved_model(model_data["path"])
+                else:
+                    raise ValueError(f"Cannot convert {model_data['format']} to TFLite")
 
-                converter.representative_dataset = representative_dataset
-                converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-                converter.inference_input_type = tf.int8
-                converter.inference_output_type = tf.int8
-            else:
-                # Dynamic range quantization
-                pass
+                # Set quantization options
+                if mode == "int8":
+                    converter.optimizations = [tf.lite.Optimize.DEFAULT]
 
-        elif mode == "fp16":
-            converter.optimizations = [tf.lite.Optimize.DEFAULT]
-            converter.target_spec.supported_types = [tf.float16]
+                    if calibration_data is not None:
+                        # Full integer quantization with calibration
+                        def representative_dataset():
+                            for data in calibration_data:
+                                yield [np.array([data], dtype=np.float32)]
 
-        elif mode == "dynamic":
-            converter.optimizations = [tf.lite.Optimize.DEFAULT]
+                        converter.representative_dataset = representative_dataset
+                        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+                        converter.inference_input_type = tf.int8
+                        converter.inference_output_type = tf.int8
+                    else:
+                        # Dynamic range quantization
+                        pass
 
-        # Convert
-        try:
-            quantized_model = converter.convert()
+                elif mode == "fp16":
+                    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+                    converter.target_spec.supported_types = [tf.float16]
 
-            # Save to file
-            with open(output_path, "wb") as f:
-                f.write(quantized_model)
+                elif mode == "dynamic":
+                    converter.optimizations = [tf.lite.Optimize.DEFAULT]
 
-            # Load quantized model to get info
-            interpreter = tf.lite.Interpreter(model_path=output_path)
-            interpreter.allocate_tensors()
+                # Convert
+                quantized_model = converter.convert()
 
-            return {
-                "model": interpreter,
-                "framework": "tensorflow_lite",
-                "format": "tflite",
-                "path": output_path,
-                "quantization_mode": mode,
-                "size_mb": os.path.getsize(output_path) / (1024 * 1024),
-                "input_details": interpreter.get_input_details(),
-                "output_details": interpreter.get_output_details(),
-            }
+                # Save to file
+                with open(output_path, "wb") as f:
+                    f.write(quantized_model)
 
-        except Exception as e:
-            raise RuntimeError(f"TensorFlow quantization failed: {str(e)}")
+                logger.debug(f"Saved quantized model to {output_path}")
+
+                # Load quantized model to get info
+                interpreter = tf.lite.Interpreter(model_path=output_path)
+                interpreter.allocate_tensors()
+
+                # If we used temp dir, copy to permanent location
+                if use_temp_dir:
+                    final_path = Path.cwd() / f"quantized_{mode}.tflite"
+                    shutil.copy(output_path, final_path)
+                    output_path = str(final_path)
+                    # Reload interpreter with final path
+                    interpreter = tf.lite.Interpreter(model_path=output_path)
+                    interpreter.allocate_tensors()
+
+                logger.info(f"TensorFlow quantization successful: {output_path}")
+
+                return {
+                    "model": interpreter,
+                    "framework": "tensorflow_lite",
+                    "format": "tflite",
+                    "path": output_path,
+                    "quantization_mode": mode,
+                    "size_mb": os.path.getsize(output_path) / (1024 * 1024),
+                    "input_details": interpreter.get_input_details(),
+                    "output_details": interpreter.get_output_details(),
+                }
+
+            except Exception as e:
+                logger.error(f"TensorFlow quantization failed: {e}", exc_info=True)
+                raise OptimizationError(
+                    f"TensorFlow quantization failed. The model format may be incompatible."
+                ) from e
 
     def _quantize_pytorch(
         self,
@@ -144,8 +176,9 @@ class Quantizer:
         try:
             import torch
             from torch.quantization import quantize_dynamic, quantize_qat, get_default_qconfig
-        except ImportError:
-            raise ImportError("PyTorch not installed")
+        except ImportError as e:
+            logger.error(f"PyTorch not installed: {e}")
+            raise ImportError("PyTorch not installed. Install with: pip install torch>=2.0.0") from e
 
         model = model_data["model"]
 
@@ -153,51 +186,69 @@ class Quantizer:
         if hasattr(model, "eval"):
             model.eval()
 
-        if output_path is None:
-            output_dir = tempfile.mkdtemp()
-            output_path = os.path.join(output_dir, f"quantized_{mode}.pth")
+        # Use temporary directory with automatic cleanup
+        use_temp_dir = output_path is None
 
-        try:
-            if mode == "int8" or mode == "dynamic":
-                # Dynamic quantization
-                if hasattr(model, "modules"):
-                    quantized_model = quantize_dynamic(
-                        model,
-                        {torch.nn.Linear, torch.nn.Conv2d, torch.nn.LSTM},
-                        dtype=torch.qint8,
-                    )
+        with temporary_directory() as tmpdir:
+            if use_temp_dir:
+                output_path = str(tmpdir / f"quantized_{mode}.pth")
+
+            logger.info(f"Quantizing PyTorch model to {mode} mode")
+
+            try:
+                if mode == "int8" or mode == "dynamic":
+                    # Dynamic quantization
+                    if hasattr(model, "modules"):
+                        quantized_model = quantize_dynamic(
+                            model,
+                            {torch.nn.Linear, torch.nn.Conv2d, torch.nn.LSTM},
+                            dtype=torch.qint8,
+                        )
+                    else:
+                        # If model is state_dict, we can't quantize it directly
+                        quantized_model = model
+                        logger.warning("Cannot quantize PyTorch state_dict directly. Need model architecture.")
+
+                elif mode == "fp16":
+                    # Half precision
+                    if hasattr(model, "half"):
+                        quantized_model = model.half()
+                    else:
+                        quantized_model = model
+
                 else:
-                    # If model is state_dict, we can't quantize it directly
-                    quantized_model = model
-                    print("Warning: Cannot quantize PyTorch state_dict directly. Need model architecture.")
+                    raise ValueError(f"Unsupported PyTorch quantization mode: {mode}")
 
-            elif mode == "fp16":
-                # Half precision
-                if hasattr(model, "half"):
-                    quantized_model = model.half()
+                # Save quantized model
+                if hasattr(quantized_model, "state_dict"):
+                    torch.save(quantized_model.state_dict(), output_path)
                 else:
-                    quantized_model = model
+                    torch.save(quantized_model, output_path)
 
-            else:
-                raise ValueError(f"Unsupported PyTorch quantization mode: {mode}")
+                logger.debug(f"Saved quantized PyTorch model to {output_path}")
 
-            # Save quantized model
-            if hasattr(quantized_model, "state_dict"):
-                torch.save(quantized_model.state_dict(), output_path)
-            else:
-                torch.save(quantized_model, output_path)
+                # If we used temp dir, copy to permanent location
+                if use_temp_dir:
+                    final_path = Path.cwd() / f"quantized_{mode}.pth"
+                    shutil.copy(output_path, final_path)
+                    output_path = str(final_path)
 
-            return {
-                "model": quantized_model,
-                "framework": "pytorch",
-                "format": "pth",
-                "path": output_path,
-                "quantization_mode": mode,
-                "size_mb": os.path.getsize(output_path) / (1024 * 1024),
-            }
+                logger.info(f"PyTorch quantization successful: {output_path}")
 
-        except Exception as e:
-            raise RuntimeError(f"PyTorch quantization failed: {str(e)}")
+                return {
+                    "model": quantized_model,
+                    "framework": "pytorch",
+                    "format": "pth",
+                    "path": output_path,
+                    "quantization_mode": mode,
+                    "size_mb": os.path.getsize(output_path) / (1024 * 1024),
+                }
+
+            except Exception as e:
+                logger.error(f"PyTorch quantization failed: {e}", exc_info=True)
+                raise OptimizationError(
+                    f"PyTorch quantization failed. The model may be incompatible."
+                ) from e
 
     def _quantize_onnx(
         self,
@@ -210,48 +261,72 @@ class Quantizer:
         try:
             import onnx
             from onnxruntime.quantization import quantize_dynamic, quantize_static, QuantType
-        except ImportError:
-            raise ImportError("ONNX quantization tools not installed")
+        except ImportError as e:
+            logger.error(f"ONNX not installed: {e}")
+            raise ImportError(
+                "ONNX quantization tools not installed. "
+                "Install with: pip install onnx onnxruntime"
+            ) from e
 
         model_path = model_data["path"]
 
-        if output_path is None:
-            output_dir = tempfile.mkdtemp()
-            output_path = os.path.join(output_dir, f"quantized_{mode}.onnx")
+        # Use temporary directory with automatic cleanup
+        use_temp_dir = output_path is None
 
-        try:
-            if mode == "int8" or mode == "dynamic":
-                # Dynamic quantization
-                quantize_dynamic(
-                    model_path,
-                    output_path,
-                    weight_type=QuantType.QInt8,
-                )
+        with temporary_directory() as tmpdir:
+            if use_temp_dir:
+                output_path = str(tmpdir / f"quantized_{mode}.onnx")
 
-            elif mode == "fp16":
-                # FP16 conversion
-                from onnxconverter_common import float16
-                model = onnx.load(model_path)
-                model_fp16 = float16.convert_float_to_float16(model)
-                onnx.save(model_fp16, output_path)
+            logger.info(f"Quantizing ONNX model to {mode} mode")
 
-            else:
-                raise ValueError(f"Unsupported ONNX quantization mode: {mode}")
+            try:
+                if mode == "int8" or mode == "dynamic":
+                    # Dynamic quantization
+                    quantize_dynamic(
+                        model_path,
+                        output_path,
+                        weight_type=QuantType.QInt8,
+                    )
 
-            # Load quantized model
-            quantized_model = onnx.load(output_path)
+                elif mode == "fp16":
+                    # FP16 conversion
+                    from onnxconverter_common import float16
+                    model = onnx.load(model_path)
+                    model_fp16 = float16.convert_float_to_float16(model)
+                    onnx.save(model_fp16, output_path)
 
-            return {
-                "model": quantized_model,
-                "framework": "onnx",
-                "format": "onnx",
-                "path": output_path,
-                "quantization_mode": mode,
-                "size_mb": os.path.getsize(output_path) / (1024 * 1024),
-            }
+                else:
+                    raise ValueError(f"Unsupported ONNX quantization mode: {mode}")
 
-        except Exception as e:
-            raise RuntimeError(f"ONNX quantization failed: {str(e)}")
+                # Load quantized model
+                quantized_model = onnx.load(output_path)
+
+                logger.debug(f"Saved quantized ONNX model to {output_path}")
+
+                # If we used temp dir, copy to permanent location
+                if use_temp_dir:
+                    final_path = Path.cwd() / f"quantized_{mode}.onnx"
+                    shutil.copy(output_path, final_path)
+                    output_path = str(final_path)
+                    # Reload model
+                    quantized_model = onnx.load(output_path)
+
+                logger.info(f"ONNX quantization successful: {output_path}")
+
+                return {
+                    "model": quantized_model,
+                    "framework": "onnx",
+                    "format": "onnx",
+                    "path": output_path,
+                    "quantization_mode": mode,
+                    "size_mb": os.path.getsize(output_path) / (1024 * 1024),
+                }
+
+            except Exception as e:
+                logger.error(f"ONNX quantization failed: {e}", exc_info=True)
+                raise OptimizationError(
+                    f"ONNX quantization failed. The model may be incompatible."
+                ) from e
 
     def measure_accuracy_loss(
         self,
